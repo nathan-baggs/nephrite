@@ -1,8 +1,13 @@
+#include <sstream>
+
 #include <Windows.h>
+#include <winternl.h>
 
 #include "utils.h"
 
 HANDLE(WINAPI *CreateFileA_orig)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE){};
+
+HANDLE(WINAPI *DeviceIoControl_orig)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED){};
 
 HANDLE WINAPI CreateFileA_hook(
     LPCSTR lpFileName,
@@ -15,14 +20,59 @@ HANDLE WINAPI CreateFileA_hook(
 {
     log("CreateFileA called with filename: {}", lpFileName);
 
-    return CreateFileA_orig(
-        lpFileName,
-        dwDesiredAccess,
-        dwShareMode,
-        lpSecurityAttributes,
-        dwCreationDisposition,
-        dwFlagsAndAttributes,
-        hTemplateFile);
+    auto res = ::GetStdHandle(STD_INPUT_HANDLE);
+
+    const auto filename = std::string_view{lpFileName};
+    if (filename.starts_with("\\\\.\\") && filename.ends_with("SecDrv"))
+    {
+        log("returning valid handle for SecDrv");
+    }
+    else
+    {
+        res = CreateFileA_orig(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
+
+    log("\tCreateFileA result: {}", res);
+    return res;
+}
+
+auto DeviceIoControl_hook(
+    HANDLE hDevice,
+    DWORD dwIoControlCode,
+    LPVOID lpInBuffer,
+    DWORD nInBufferSize,
+    LPVOID lpOutBuffer,
+    DWORD nOutBufferSize,
+    LPDWORD lpBytesReturned,
+    LPOVERLAPPED lpOverlapped) -> HANDLE
+{
+    auto strm = std::stringstream{};
+    const auto *byte = reinterpret_cast<const BYTE *>(lpInBuffer);
+
+    for (auto i = 0u; i < nInBufferSize; ++i)
+    {
+        strm << std::format("{:02x} ", byte[i]);
+    }
+
+    const auto bytes_str = strm.str();
+    log("DeviceIoControl called with device: {} | buffer: {}", hDevice, bytes_str);
+
+    return DeviceIoControl_orig(
+        hDevice,
+        dwIoControlCode,
+        lpInBuffer,
+        nInBufferSize,
+        lpOutBuffer,
+        nOutBufferSize,
+        lpBytesReturned,
+        lpOverlapped);
 }
 
 auto overwrite_address(void **dst, void *src) -> void
@@ -90,7 +140,6 @@ auto hook_iat(const std::string &dll, const std::string &function, PROC hooked_f
                     *orig_function = reinterpret_cast<::PROC>(thunk_data->u1.Function);
                     overwrite_address(
                         reinterpret_cast<void **>(&thunk_data->u1.Function), reinterpret_cast<void *>(hooked_function));
-                    // thunk_data->u1.Function = reinterpret_cast<::ULONGLONG>(hooked_function);
                     return true;
                 }
             }
@@ -117,6 +166,12 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD fdwReason, LPVOID)
                 reinterpret_cast<::PROC>(CreateFileA_hook),
                 reinterpret_cast<::PROC *>(&CreateFileA_orig));
 
+            hook_iat(
+                "kernel32.dll",
+                "DeviceIoControl",
+                reinterpret_cast<::PROC>(DeviceIoControl_hook),
+                reinterpret_cast<::PROC *>(&DeviceIoControl_orig));
+
             break;
         }
         case DLL_PROCESS_DETACH: log("DLL_PROCESS_DETACH"); break;
@@ -126,4 +181,3 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD fdwReason, LPVOID)
 
     return TRUE;
 }
-
