@@ -19,6 +19,35 @@ auto wide_str_to_narrow_str(const std::wstring &wstr) -> std::string
     return str;
 }
 
+auto prepare_ioctl_response(std::uint32_t *out_buffer, std::uint32_t val1, std::uint32_t val2) -> void
+{
+    const auto *kernel_tick_ptr = reinterpret_cast<std::uint32_t *volatile>(0x7ffe0320);
+    const auto kernel_tick = *kernel_tick_ptr;
+
+    const auto seed = 0xf367ac7f;
+    auto tmp = seed;
+    std::uint32_t test_buffer[4]{};
+
+    test_buffer[0] = kernel_tick;
+
+    for (auto i = 3u; i > 0; --i)
+    {
+        tmp = tmp * -0xd5acb1b + 0x361962e9;
+        test_buffer[i] = tmp;
+        test_buffer[0] ^= tmp;
+    }
+
+    out_buffer[0] = 0x4;
+    out_buffer[1] = 0x3;
+    out_buffer[2] = 0x56;
+    out_buffer[3] = test_buffer[0];
+    out_buffer[4] = test_buffer[1];
+    out_buffer[5] = test_buffer[2];
+    out_buffer[6] = test_buffer[3];
+    out_buffer[0x40c / 4] = val1;
+    out_buffer[0x410 / 4] = val2;
+}
+
 HANDLE WINAPI CreateFileA_hook(
     LPCSTR lpFileName,
     DWORD dwDesiredAccess,
@@ -98,15 +127,114 @@ auto WINAPI DeviceIoControl_hook(
         log("DeviceIoControl called with device: {} | {:#x} | buffer: {}", hDevice, dwIoControlCode, bytes_str);
     }
 
-    const auto res = DeviceIoControl_orig(
-        hDevice,
-        dwIoControlCode,
-        lpInBuffer,
-        nInBufferSize,
-        lpOutBuffer,
-        nOutBufferSize,
-        lpBytesReturned,
-        lpOverlapped);
+    auto res = BOOL{1};
+    auto call_orig = true;
+
+    if (dwIoControlCode == 0xef002407)
+    {
+        log("handling secdrv ioctol");
+        auto *out_buffer = reinterpret_cast<std::uint32_t *>(lpOutBuffer);
+        auto *in_buffer = reinterpret_cast<std::uint32_t *>(lpInBuffer);
+        const auto *in_buffer_check =
+            reinterpret_cast<std::uint32_t *>(reinterpret_cast<std::uint8_t *>(lpInBuffer) + 0x414);
+
+        switch (reinterpret_cast<std::uint8_t *>(lpInBuffer)[0xc])
+        {
+            case 0x3c:
+            {
+                log("secdrv ioctl: 0x3c");
+                prepare_ioctl_response(out_buffer, 0x4, 0x400);
+                call_orig = false;
+
+                break;
+            }
+            case 0x3d:
+            {
+                log("secdrv ioctl: 0x3d");
+                prepare_ioctl_response(out_buffer, 0x4, 0x2c8);
+                call_orig = false;
+
+                break;
+            }
+            case 0x3e:
+            {
+                log("secdrv ioctl: 0x3e");
+                prepare_ioctl_response(out_buffer, 0x4, 0x5278d11b);
+                call_orig = false;
+
+                break;
+            }
+            case 0x3f:
+            {
+                log("secdrv ioctl: 0x3f");
+
+                if (in_buffer_check[0] < 0x61)
+                {
+                    prepare_ioctl_response(out_buffer, 0x4, 0x0);
+                }
+                else
+                {
+                    log("failed some check, returning 0");
+                    res = 0;
+                }
+
+                call_orig = false;
+
+                break;
+            }
+            case 0x41:
+            {
+                log("secdrv ioctl: 0x41");
+
+                if (in_buffer_check[0] != 0)
+                {
+                    prepare_ioctl_response(out_buffer, 0x4, 0x0);
+                }
+                else
+                {
+                    log("failed some check, returning 0");
+                    res = 0;
+                }
+
+                call_orig = false;
+
+                break;
+            }
+            case 0x43:
+            {
+                log("secdrv ioctl: 0x43");
+
+                if ((in_buffer_check[1] < 8) && (in_buffer_check[0] == 0x98A64100) && (in_buffer_check[1] != 4))
+                {
+                    prepare_ioctl_response(out_buffer, 0x4, 0x0);
+                }
+                else
+                {
+                    log("failed some check, returning 0");
+                    res = 0;
+                }
+
+                call_orig = false;
+
+                break;
+            }
+        }
+    }
+
+    if (call_orig)
+    {
+        log("forwarding to original DeviceIoControl");
+
+        res = DeviceIoControl_orig(
+            hDevice,
+            dwIoControlCode,
+            lpInBuffer,
+            nInBufferSize,
+            lpOutBuffer,
+            nOutBufferSize,
+            lpBytesReturned,
+            lpOverlapped);
+    }
 
     if (res && lpOutBuffer && nOutBufferSize > 0 && lpBytesReturned && *lpBytesReturned > 0)
     {
