@@ -1,4 +1,5 @@
 #include <sstream>
+#include <stacktrace>
 
 #include <Windows.h>
 #include <winternl.h>
@@ -6,8 +7,17 @@
 #include "utils.h"
 
 HANDLE(WINAPI *CreateFileA_orig)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE){};
+HANDLE(WINAPI *CreateFileW_orig)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE){};
 
-HANDLE(WINAPI *DeviceIoControl_orig)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED){};
+BOOL(WINAPI *DeviceIoControl_orig)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED){};
+
+auto wide_str_to_narrow_str(const std::wstring &wstr) -> std::string
+{
+    auto len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    auto str = std::string(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, str.data(), len, nullptr, nullptr);
+    return str;
+}
 
 HANDLE WINAPI CreateFileA_hook(
     LPCSTR lpFileName,
@@ -20,30 +30,51 @@ HANDLE WINAPI CreateFileA_hook(
 {
     log("CreateFileA called with filename: {}", lpFileName);
 
-    auto res = ::GetStdHandle(STD_INPUT_HANDLE);
-
-    const auto filename = std::string_view{lpFileName};
-    if (filename.starts_with("\\\\.\\") && filename.ends_with("SecDrv"))
-    {
-        log("returning valid handle for SecDrv");
-    }
-    else
-    {
-        res = CreateFileA_orig(
-            lpFileName,
-            dwDesiredAccess,
-            dwShareMode,
-            lpSecurityAttributes,
-            dwCreationDisposition,
-            dwFlagsAndAttributes,
-            hTemplateFile);
-    }
+    const auto res = CreateFileA_orig(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
 
     log("\tCreateFileA result: {}", res);
     return res;
 }
 
-auto DeviceIoControl_hook(
+HANDLE WINAPI CreateFileW_hook(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile)
+{
+    const auto narrow_str = wide_str_to_narrow_str(lpFileName);
+    if (!narrow_str.contains("log.txt"))
+    {
+        log("CreateFileW called with filename: {}", narrow_str);
+    }
+
+    const auto res = CreateFileW_orig(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
+
+    if (!narrow_str.contains("log.txt"))
+    {
+        log("\tCreateFileW result: {}", res);
+    }
+    return res;
+}
+
+auto WINAPI DeviceIoControl_hook(
     HANDLE hDevice,
     DWORD dwIoControlCode,
     LPVOID lpInBuffer,
@@ -51,20 +82,23 @@ auto DeviceIoControl_hook(
     LPVOID lpOutBuffer,
     DWORD nOutBufferSize,
     LPDWORD lpBytesReturned,
-    LPOVERLAPPED lpOverlapped) -> HANDLE
+    LPOVERLAPPED lpOverlapped) -> BOOL
 {
-    auto strm = std::stringstream{};
-    const auto *byte = reinterpret_cast<const BYTE *>(lpInBuffer);
-
-    for (auto i = 0u; i < nInBufferSize; ++i)
+    if (lpInBuffer && nInBufferSize > 0)
     {
-        strm << std::format("{:02x} ", byte[i]);
+        auto strm = std::stringstream{};
+        const auto *byte = reinterpret_cast<const BYTE *>(lpInBuffer);
+
+        for (auto i = 0u; i < nInBufferSize; ++i)
+        {
+            strm << std::format("{:02x} ", byte[i]);
+        }
+
+        const auto bytes_str = strm.str();
+        log("DeviceIoControl called with device: {} | {:#x} | buffer: {}", hDevice, dwIoControlCode, bytes_str);
     }
 
-    const auto bytes_str = strm.str();
-    log("DeviceIoControl called with device: {} | buffer: {}", hDevice, bytes_str);
-
-    return DeviceIoControl_orig(
+    const auto res = DeviceIoControl_orig(
         hDevice,
         dwIoControlCode,
         lpInBuffer,
@@ -73,6 +107,24 @@ auto DeviceIoControl_hook(
         nOutBufferSize,
         lpBytesReturned,
         lpOverlapped);
+
+    if (res && lpOutBuffer && nOutBufferSize > 0 && lpBytesReturned && *lpBytesReturned > 0)
+    {
+        log("DeviceIoControl returned {} bytes", *lpBytesReturned);
+
+        auto strm = std::stringstream{};
+        const auto *byte = reinterpret_cast<const BYTE *>(lpOutBuffer);
+
+        for (auto i = 0u; i < nOutBufferSize; ++i)
+        {
+            strm << std::format("{:02x} ", byte[i]);
+        }
+
+        const auto bytes_str = strm.str();
+        log("DeviceIoControl result: {} | buffer: {}", res, bytes_str);
+    }
+
+    return res;
 }
 
 auto overwrite_address(void **dst, void *src) -> void
@@ -165,6 +217,12 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD fdwReason, LPVOID)
                 "CreateFileA",
                 reinterpret_cast<::PROC>(CreateFileA_hook),
                 reinterpret_cast<::PROC *>(&CreateFileA_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "CreateFileW",
+                reinterpret_cast<::PROC>(CreateFileW_hook),
+                reinterpret_cast<::PROC *>(&CreateFileW_orig));
 
             hook_iat(
                 "kernel32.dll",

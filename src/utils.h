@@ -15,7 +15,8 @@ auto log(std::format_string<T...> fmt, T &&...args) -> void
 
     if (auto file = std::ofstream{log_path, std::ios::app}; file)
     {
-        file << std::format(fmt, args...) << '\n';
+        const auto str = std::format(fmt, std::forward<T>(args)...);
+        file << str << '\n';
     }
 }
 
@@ -37,4 +38,3 @@ auto ensure(bool cond, std::format_string<T...> fmt, T &&...args) -> void
         die(fmt, args...);
     }
 }
-
