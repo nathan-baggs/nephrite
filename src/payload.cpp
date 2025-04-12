@@ -59,16 +59,26 @@ HANDLE WINAPI CreateFileA_hook(
 {
     log("CreateFileA called with filename: {}", lpFileName);
 
-    const auto res = CreateFileA_orig(
-        lpFileName,
-        dwDesiredAccess,
-        dwShareMode,
-        lpSecurityAttributes,
-        dwCreationDisposition,
-        dwFlagsAndAttributes,
-        hTemplateFile);
+    auto res = reinterpret_cast<::HANDLE>(0x1234);
+
+    if (std::string_view{lpFileName}.contains("SecDrv"))
+    {
+        log("CreateFileW called with secdrv.sys");
+    }
+    else
+    {
+        res = CreateFileA_orig(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+    }
 
     log("\tCreateFileA result: {}", res);
+
     return res;
 }
 
@@ -81,25 +91,35 @@ HANDLE WINAPI CreateFileW_hook(
     DWORD dwFlagsAndAttributes,
     HANDLE hTemplateFile)
 {
+    auto res = reinterpret_cast<::HANDLE>(0x1234);
+
     const auto narrow_str = wide_str_to_narrow_str(lpFileName);
     if (!narrow_str.contains("log.txt"))
     {
         log("CreateFileW called with filename: {}", narrow_str);
     }
 
-    const auto res = CreateFileW_orig(
-        lpFileName,
-        dwDesiredAccess,
-        dwShareMode,
-        lpSecurityAttributes,
-        dwCreationDisposition,
-        dwFlagsAndAttributes,
-        hTemplateFile);
-
-    if (!narrow_str.contains("log.txt"))
+    if (std::wstring_view{lpFileName}.contains(L"SecDrv"))
     {
-        log("\tCreateFileW result: {}", res);
+        log("CreateFileW called with secdrv.sys");
     }
+    else
+    {
+        res = CreateFileW_orig(
+            lpFileName,
+            dwDesiredAccess,
+            dwShareMode,
+            lpSecurityAttributes,
+            dwCreationDisposition,
+            dwFlagsAndAttributes,
+            hTemplateFile);
+
+        if (!narrow_str.contains("log.txt"))
+        {
+            log("\tCreateFileW result: {}", res);
+        }
+    }
+
     return res;
 }
 
