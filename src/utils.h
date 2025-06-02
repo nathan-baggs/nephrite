@@ -1,17 +1,31 @@
 #pragma once
 
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <ostream>
 #include <print>
+#include <string_view>
+
+#include <Windows.h>
+
+inline auto get_temp(std::string_view filename) -> std::filesystem::path
+{
+    char tempPath[MAX_PATH]{};
+    ::GetEnvironmentVariableA("TEMP", tempPath, MAX_PATH);
+    return std::filesystem::path{tempPath} / filename;
+}
 
 template <class... T>
 auto log(std::format_string<T...> fmt, T &&...args) -> void
 {
-    char tempPath[MAX_PATH]{};
-    ::GetEnvironmentVariableA("TEMP", tempPath, MAX_PATH);
-    const auto log_path = std::format("{}/log.txt", tempPath);
+    static auto mtx = std::mutex{};
+
+    std::scoped_lock lock{mtx};
+
+    const auto log_path = get_temp("log.txt");
 
     if (auto file = std::ofstream{log_path, std::ios::app}; file)
     {
@@ -23,8 +37,8 @@ auto log(std::format_string<T...> fmt, T &&...args) -> void
 template <class... T>
 auto die(std::format_string<T...> fmt, T &&...args) -> void
 {
-    log(fmt, args...);
-    std::println(fmt, args...);
+    log(fmt, std::forward<T>(args)...);
+    std::println(fmt, std::forward<T>(args)...);
     std::cout << std::flush;
 
     std::exit(1);
@@ -35,6 +49,6 @@ auto ensure(bool cond, std::format_string<T...> fmt, T &&...args) -> void
 {
     if (!cond)
     {
-        die(fmt, args...);
+        die(fmt, std::forward<T>(args)...);
     }
 }
