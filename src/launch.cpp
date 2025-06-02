@@ -4,7 +4,7 @@
 
 #include "utils.h"
 
-auto main() -> int
+auto main(int argc, char **argv) -> int
 {
     log("launching game");
 
@@ -12,7 +12,7 @@ auto main() -> int
     auto pi = ::PROCESS_INFORMATION{};
 
     const auto game =
-        ::CreateProcessA("bond.exe", nullptr, nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi);
+        ::CreateProcessA(argv[1], nullptr, nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi);
     ensure(game, "CreateProcess failed");
 
     const auto remote_buffer = ::VirtualAllocEx(pi.hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
