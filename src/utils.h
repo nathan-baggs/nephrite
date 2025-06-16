@@ -30,7 +30,7 @@ auto log(std::format_string<T...> fmt, T &&...args) -> void
     if (auto file = std::ofstream{log_path, std::ios::app}; file)
     {
         const auto str = std::format(fmt, std::forward<T>(args)...);
-        file << str << '\n';
+        file << str << std::endl;
     }
 }
 

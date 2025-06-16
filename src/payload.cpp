@@ -4,12 +4,45 @@
 #include <Windows.h>
 #include <winternl.h>
 
+#include "ioctl_recorder.h"
+#include "ioctl_replayer.h"
 #include "utils.h"
 
 HANDLE(WINAPI *CreateFileA_orig)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE){};
 HANDLE(WINAPI *CreateFileW_orig)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE){};
-
+UINT(WINAPI *GetDriveTypeA_orig)(LPCSTR){};
+UINT(WINAPI *GetDriveTypeW_orig)(LPCWSTR){};
+BOOL(WINAPI *ReadFile_orig)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED){};
+BOOL(WINAPI *GetVolumeInformationA_orig)(LPCSTR, LPSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPSTR, DWORD){};
+DWORD(WINAPI *QueryDosDeviceA_orig)(LPCSTR, LPSTR, DWORD){};
+DWORD(WINAPI *QueryDosDeviceW_orig)(LPCWSTR, LPWSTR, DWORD){};
+DWORD(WINAPI *GetLogicalDrives_orig)(){};
+BOOL(WINAPI *GetDiskFreeSpaceA_orig)(LPCSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD){};
+BOOL(WINAPI *GetDiskFreeSpaceW_orig)(LPCWSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD){};
 BOOL(WINAPI *DeviceIoControl_orig)(HANDLE, DWORD, LPVOID, DWORD, LPVOID, DWORD, LPDWORD, LPOVERLAPPED){};
+HANDLE(WINAPI *FindFirstVolumeA_orig)(LPSTR, DWORD){};
+HANDLE(WINAPI *FindFirstVolumeW_orig)(LPWSTR, DWORD){};
+DWORD(WINAPI *GetFileAttributesA_orig)(LPCSTR){};
+DWORD(WINAPI *GetFileAttributesW_orig)(LPCWSTR){};
+BOOL(WINAPI *IsDebuggerPresent_orig)(VOID){};
+BOOL(WINAPI *ReadProcessMemory_orig)(HANDLE, LPCVOID, LPVOID, SIZE_T, SIZE_T *){};
+BOOL(WINAPI *WriteProcessMemory_orig)(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T *){};
+UINT(WINAPI *GetProfileIntA_orig)(LPCSTR, LPCSTR, UINT){};
+void(WINAPI *ExitProcess_orig)(UINT){};
+BOOL(WINAPI *TerminateProcess_orig)(HANDLE, UINT){};
+BOOL(WINAPI *CreateProcessA_orig)(
+    LPCSTR,
+    LPSTR,
+    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES,
+    BOOL,
+    DWORD,
+    LPVOID,
+    LPCSTR,
+    LPSTARTUPINFOA,
+    LPPROCESS_INFORMATION){};
+
+static auto g_disable_logging = false;
 
 auto wide_str_to_narrow_str(const std::wstring &wstr) -> std::string
 {
@@ -48,6 +81,131 @@ auto prepare_ioctl_response(std::uint32_t *out_buffer, std::uint32_t val1, std::
     out_buffer[0x410 / 4] = val2;
 }
 
+BOOL WINAPI CreateProcessA_hook(
+    LPCSTR lpApplicationName,
+    LPSTR lpCommandLine,
+    LPSECURITY_ATTRIBUTES lpProcessAttributes,
+    LPSECURITY_ATTRIBUTES lpThreadAttributes,
+    BOOL bInheritHandles,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCSTR lpCurrentDirectory,
+    LPSTARTUPINFOA lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation)
+{
+    log("CreateProcessA called with application name: {} | command line: {}", lpApplicationName, lpCommandLine);
+
+    auto res = CreateProcessA_orig(
+        lpApplicationName,
+        lpCommandLine,
+        lpProcessAttributes,
+        lpThreadAttributes,
+        bInheritHandles,
+        dwCreationFlags,
+        lpEnvironment,
+        lpCurrentDirectory,
+        lpStartupInfo,
+        lpProcessInformation);
+
+    log("\tCreateProcessA result: {}", res);
+
+    return res;
+}
+
+BOOL WINAPI IsDebuggerPresent_hook()
+{
+    log("IsDebuggerPresent called");
+
+    return FALSE;
+}
+
+BOOL WINAPI TerminateProcess_hook(HANDLE hProcess, UINT uExitCode)
+{
+    log("TerminateProcess called with process: {} | exit code: {}", hProcess, uExitCode);
+
+    ::MessageBeep(0x0);
+    ::Sleep(10000);
+    ::MessageBeep(0x0);
+
+    log("resuming");
+
+    return TerminateProcess_orig(hProcess, uExitCode);
+}
+
+void WINAPI ExitProcess_hook(UINT uExitCode)
+{
+    log("ExitProcess called with exit code: {}", uExitCode);
+
+    ::Sleep(5000);
+
+    ExitProcess_orig(uExitCode);
+}
+
+UINT WINAPI GetProfileIntA_hook(LPCSTR lpAppName, LPCSTR lpKeyName, INT nDefault)
+{
+    log("GetProfileIntA called with app name: {} | key name: {} | default: {}", lpAppName, lpKeyName, nDefault);
+    const auto res = GetProfileIntA_orig(lpAppName, lpKeyName, nDefault);
+
+    log("\tGetProfileIntA result: {}", res);
+
+    return res;
+}
+
+BOOL WINAPI ReadProcessMemory_hook(
+    HANDLE hProcess,
+    LPCVOID lpBaseAddress,
+    LPVOID lpBuffer,
+    SIZE_T nSize,
+    SIZE_T *lpNumberOfBytesRead)
+{
+    log("ReadProcessMemory called with process: {} | address: {} | size: {}", hProcess, lpBaseAddress, nSize);
+
+    auto res = ReadProcessMemory_orig(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+
+    if (res && hProcess == ::GetCurrentProcess())
+    {
+        const auto *patch_addr = reinterpret_cast<void *>(0x0040aa56);
+        if (patch_addr > lpBaseAddress &&
+            patch_addr < reinterpret_cast<const void *>(reinterpret_cast<const std::uint8_t *>(lpBaseAddress) + nSize))
+        {
+            const auto offset = reinterpret_cast<const std::uint8_t *>(patch_addr) -
+                                reinterpret_cast<const std::uint8_t *>(lpBaseAddress);
+            log("patch address {} is within the read range, undoing patch {}", patch_addr, offset);
+            reinterpret_cast<std::uint8_t *>(lpBuffer)[offset] = 0x67;
+
+            auto strm = std::stringstream{};
+            const auto *byte = reinterpret_cast<const BYTE *>(lpBuffer);
+
+            for (auto i = 0u; i < nSize; ++i)
+            {
+                strm << std::format("{:02x} ", byte[i]);
+            }
+
+            const auto bytes_str = strm.str();
+            log("ReadProcessMemory buffer: {} | {}", bytes_str, nSize);
+        }
+    }
+
+    log("\tReadProcessMemory result: {}", res);
+
+    return res;
+}
+
+BOOL WINAPI WriteProcessMemory_hook(
+    HANDLE hProcess,
+    LPVOID lpBaseAddress,
+    LPCVOID lpBuffer,
+    SIZE_T nSize,
+    SIZE_T *lpNumberOfBytesWritten)
+{
+    log("WriteProcessMemory called with process: {} | address: {} | size: {}", hProcess, lpBaseAddress, nSize);
+
+    auto res = WriteProcessMemory_orig(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesWritten);
+    log("\tWriteProcessMemory result: {}", res);
+
+    return res;
+}
+
 HANDLE WINAPI CreateFileA_hook(
     LPCSTR lpFileName,
     DWORD dwDesiredAccess,
@@ -61,12 +219,19 @@ HANDLE WINAPI CreateFileA_hook(
 
     auto res = reinterpret_cast<::HANDLE>(0x1234);
 
-    if (std::string_view{lpFileName}.contains("SecDrv"))
+    if (std::string_view{lpFileName}.contains("SecDrv") || std::string_view{lpFileName}.contains("Secdrv"))
     {
-        log("CreateFileW called with secdrv.sys");
+        log("CreateFileA called with secdrv.sys");
     }
     else
     {
+        if (std::string_view{lpFileName}.contains("win.ini"))
+        {
+            ::MessageBeep(0x0);
+            ::Sleep(10000);
+            ::MessageBeep(0x0);
+        }
+
         res = CreateFileA_orig(
             lpFileName,
             dwDesiredAccess,
@@ -96,12 +261,18 @@ HANDLE WINAPI CreateFileW_hook(
     const auto narrow_str = wide_str_to_narrow_str(lpFileName);
     if (!narrow_str.contains("log.txt"))
     {
-        log("CreateFileW called with filename: {}", narrow_str);
+        if (!g_disable_logging)
+        {
+            log("CreateFileW called with filename: {}", narrow_str);
+        }
     }
 
     if (std::wstring_view{lpFileName}.contains(L"SecDrv"))
     {
-        log("CreateFileW called with secdrv.sys");
+        if (!g_disable_logging)
+        {
+            log("CreateFileW called with secdrv.sys");
+        }
     }
     else
     {
@@ -116,7 +287,10 @@ HANDLE WINAPI CreateFileW_hook(
 
         if (!narrow_str.contains("log.txt"))
         {
-            log("\tCreateFileW result: {}", res);
+            if (!g_disable_logging)
+            {
+                log("\tCreateFileW result: {}", res);
+            }
         }
     }
 
@@ -133,6 +307,9 @@ auto WINAPI DeviceIoControl_hook(
     LPDWORD lpBytesReturned,
     LPOVERLAPPED lpOverlapped) -> BOOL
 {
+    static auto counter = 0u;
+    ++counter;
+
     if (lpInBuffer && nInBufferSize > 0)
     {
         auto strm = std::stringstream{};
@@ -144,7 +321,19 @@ auto WINAPI DeviceIoControl_hook(
         }
 
         const auto bytes_str = strm.str();
-        log("DeviceIoControl called with device: {} | {:#x} | buffer: {}", hDevice, dwIoControlCode, bytes_str);
+        log("DeviceIoControl called with device: {} | {:#x} | buffer: {} {}",
+            hDevice,
+            dwIoControlCode,
+            bytes_str,
+            counter);
+    }
+    else
+    {
+        log("DeviceIoControl called with device: {} | {:#x} | buffer: {} {}",
+            hDevice,
+            dwIoControlCode,
+            "NULL",
+            counter);
     }
 
     auto res = BOOL{1};
@@ -238,12 +427,20 @@ auto WINAPI DeviceIoControl_hook(
 
                 break;
             }
+            default:
+            {
+                log("secdrv ioctl: unknown code: {:#x}", reinterpret_cast<std::uint8_t *>(lpInBuffer)[0xc]);
+            }
         }
+    }
+    else if (dwIoControlCode == 0x24000)
+    {
+        call_orig = false;
     }
 
     if (call_orig)
     {
-        log("forwarding to original DeviceIoControl");
+        log("forwarding to original DeviceIoControl {}", counter);
 
         res = DeviceIoControl_orig(
             hDevice,
@@ -254,12 +451,20 @@ auto WINAPI DeviceIoControl_hook(
             nOutBufferSize,
             lpBytesReturned,
             lpOverlapped);
+        log("\tDeviceIoControl result: {} {}", res, counter);
+
+        //     g_disable_logging = true;
+        //     static auto recorder = IoctlRecorder{get_temp("all_recording")};
+        //     g_disable_logging = false;
+        //
+        //     recorder.record(
+        //         std::span{reinterpret_cast<std::uint8_t *>(lpOutBuffer), static_cast<std::size_t>(nOutBufferSize)},
+        //         *lpBytesReturned,
+        //         res);
     }
 
-    if (res && lpOutBuffer && nOutBufferSize > 0 && lpBytesReturned && *lpBytesReturned > 0)
+    if (res && lpOutBuffer && nOutBufferSize > 0)
     {
-        log("DeviceIoControl returned {} bytes", *lpBytesReturned);
-
         auto strm = std::stringstream{};
         const auto *byte = reinterpret_cast<const BYTE *>(lpOutBuffer);
 
@@ -269,8 +474,210 @@ auto WINAPI DeviceIoControl_hook(
         }
 
         const auto bytes_str = strm.str();
-        log("DeviceIoControl result: {} | buffer: {}", res, bytes_str);
+        log("DeviceIoControl result: {} | buffer: {} {}", res, bytes_str, counter);
     }
+    else
+    {
+        log("{} {} {} {}", res, lpBytesReturned ? *lpBytesReturned : 0, nOutBufferSize, counter);
+        log("DeviceIoControl result: {} | buffer: {}", res, counter);
+    }
+
+    return res;
+}
+
+auto WINAPI GetDriveTypeW_hook(LPCWSTR lpRootPathName) -> UINT
+{
+    log("GetDriveTypeW called with path: {}", wide_str_to_narrow_str(lpRootPathName));
+
+    auto res = GetDriveTypeW_orig(lpRootPathName);
+    log("\tGetDriveTypeW result: {}", res);
+
+    return res;
+}
+
+auto WINAPI GetDriveTypeA_hook(LPCSTR lpRootPathName) -> UINT
+{
+    log("GetDriveTypeA called with path: {}", lpRootPathName);
+
+    auto res = DRIVE_CDROM;
+
+    if (std::string_view{lpRootPathName} == "C:\\DiscNoir\\tin3_dxd.ICD")
+    {
+        log("icd file");
+        ::MessageBeep(0x0);
+        ::Sleep(10000);
+        ::MessageBeep(0x0);
+    }
+
+    // if (!std::string_view{lpRootPathName}.starts_with("X:"))
+    // {
+    //     log("forwarding to original GetDriveTypeA");
+    res = GetDriveTypeA_orig(lpRootPathName);
+    // }
+    //
+    log("\tGetDriveTypeA result: {}", res);
+
+    return res;
+}
+
+auto WINAPI ReadFile_hook(
+    HANDLE hFile,
+    LPVOID lpBuffer,
+    DWORD nNumberOfBytesToRead,
+    LPDWORD lpNumberOfBytesRead,
+    LPOVERLAPPED lpOverlapped) -> BOOL
+{
+    if (!g_disable_logging)
+    {
+        log("ReadFile called with file: {}", hFile);
+    }
+
+    auto res = ReadFile_orig(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped);
+
+    if (!g_disable_logging)
+    {
+        log("\tReadFile result: {}", res);
+    }
+
+    return res;
+}
+
+auto WINAPI GetVolumeInformationA_hook(
+    LPCSTR lpRootPathName,
+    LPSTR lpVolumeNameBuffer,
+    DWORD nVolumeNameSize,
+    LPDWORD lpVolumeSerialNumber,
+    LPDWORD lpMaximumComponentLength,
+    LPDWORD lpFileSystemFlags,
+    LPSTR lpFileSystemNameBuffer,
+    DWORD nFileSystemNameSize) -> BOOL
+{
+    log("GetVolumeInformationA called with path: {}", lpRootPathName);
+
+    auto res = GetVolumeInformationA_orig(
+        lpRootPathName,
+        lpVolumeNameBuffer,
+        nVolumeNameSize,
+        lpVolumeSerialNumber,
+        lpMaximumComponentLength,
+        lpFileSystemFlags,
+        lpFileSystemNameBuffer,
+        nFileSystemNameSize);
+    log("\tGetVolumeInformationA result: {}", res);
+
+    return res;
+}
+
+auto WINAPI QueryDosDeviceA_hook(LPCSTR lpDeviceName, LPSTR lpTargetPath, DWORD ucchMax) -> DWORD
+{
+    log("QueryDosDeviceA called with device: {}", lpDeviceName);
+
+    auto res = QueryDosDeviceA_orig(lpDeviceName, lpTargetPath, ucchMax);
+    log("\tQueryDosDeviceA result: {}", res);
+
+    return res;
+}
+
+auto WINAPI QueryDosDeviceW_hook(LPCWSTR lpDeviceName, LPWSTR lpTargetPath, DWORD ucchMax) -> DWORD
+{
+    log("QueryDosDeviceW called with device: {}", wide_str_to_narrow_str(lpDeviceName));
+
+    auto res = QueryDosDeviceW_orig(lpDeviceName, lpTargetPath, ucchMax);
+    log("\tQueryDosDeviceW result: {}", res);
+
+    return res;
+}
+
+auto WINAPI GetLogicalDrives_hook() -> DWORD
+{
+    log("GetLogicalDrives called");
+
+    auto res = GetLogicalDrives_orig();
+    log("\tGetLogicalDrives result: {}", res);
+
+    return res;
+}
+
+auto WINAPI GetDiskFreeSpaceA_hook(
+    LPCSTR lpRootPathName,
+    LPDWORD lpSectorsPerCluster,
+    LPDWORD lpBytesPerSector,
+    LPDWORD lpNumberOfFreeClusters,
+    LPDWORD lpTotalNumberOfClusters) -> BOOL
+{
+    log("GetDiskFreeSpaceA called with path: {}", lpRootPathName);
+
+    auto res = GetDiskFreeSpaceA_orig(
+        lpRootPathName, lpSectorsPerCluster, lpBytesPerSector, lpNumberOfFreeClusters, lpTotalNumberOfClusters);
+    log("\tGetDiskFreeSpaceA result: {}", res);
+
+    return res;
+}
+
+auto WINAPI GetDiskFreeSpaceW_hook(
+    LPCWSTR lpRootPathName,
+    LPDWORD lpSectorsPerCluster,
+    LPDWORD lpBytesPerSector,
+    LPDWORD lpNumberOfFreeClusters,
+    LPDWORD lpTotalNumberOfClusters) -> BOOL
+{
+    log("GetDiskFreeSpaceW called with path: {}", wide_str_to_narrow_str(lpRootPathName));
+
+    auto res = GetDiskFreeSpaceW_orig(
+        lpRootPathName, lpSectorsPerCluster, lpBytesPerSector, lpNumberOfFreeClusters, lpTotalNumberOfClusters);
+    log("\tGetDiskFreeSpaceW result: {}", res);
+
+    return res;
+}
+
+auto WINAPI FindFirstVolumeA_hook(LPSTR lpszVolumeName, DWORD cchBufferLength) -> HANDLE
+{
+    log("FindFirstVolumeA called with volume: {}", lpszVolumeName);
+
+    auto res = FindFirstVolumeA_orig(lpszVolumeName, cchBufferLength);
+    log("\tFindFirstVolumeA result: {}", res);
+
+    return res;
+}
+
+auto WINAPI FindFirstVolumeW_hook(LPWSTR lpszVolumeName, DWORD cchBufferLength) -> HANDLE
+{
+    log("FindFirstVolumeW called with volume: {}", wide_str_to_narrow_str(lpszVolumeName));
+
+    auto res = FindFirstVolumeW_orig(lpszVolumeName, cchBufferLength);
+    log("\tFindFirstVolumeW result: {}", res);
+
+    return res;
+}
+
+auto WINAPI GetFileAttributesA_hook(LPCSTR lpFileName) -> DWORD
+{
+    if (lpFileName)
+    {
+        log("GetFileAttributesA called with filename: {} {}", lpFileName, std::string_view{lpFileName}.length());
+    }
+
+    if (std::string_view{lpFileName} == "D:\\00000001.TMP")
+    {
+        log("routing call to local file");
+        lpFileName = "00000001.TMP";
+    }
+
+    auto res = GetFileAttributesA_orig(lpFileName);
+    log("\tGetFileAttributesA result: {}", res);
+
+    return res;
+}
+
+auto WINAPI GetFileAttributesW_hook(LPCWSTR lpFileName) -> DWORD
+{
+    if (lpFileName)
+    {
+        log("GetFileAttributesW called with filename: {}", wide_str_to_narrow_str(lpFileName));
+    }
+
+    auto res = GetFileAttributesW_orig(lpFileName);
+    log("\tGetFileAttributesW result: {}", res);
 
     return res;
 }
@@ -349,6 +756,7 @@ auto hook_iat(const std::string &dll, const std::string &function, PROC hooked_f
         ++import_descriptor;
     }
 
+    log("failed to hook function: {} in module: {}", function, dll);
     return false;
 }
 
@@ -378,6 +786,204 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD fdwReason, LPVOID)
                 reinterpret_cast<::PROC>(DeviceIoControl_hook),
                 reinterpret_cast<::PROC *>(&DeviceIoControl_orig));
 
+            hook_iat(
+                "kernel32.dll",
+                "GetDriveTypeW",
+                reinterpret_cast<::PROC>(GetDriveTypeW_hook),
+                reinterpret_cast<::PROC *>(&GetDriveTypeW_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "GetDriveTypeA",
+                reinterpret_cast<::PROC>(GetDriveTypeA_hook),
+                reinterpret_cast<::PROC *>(&GetDriveTypeA_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "ReadFile",
+                reinterpret_cast<::PROC>(ReadFile_hook),
+                reinterpret_cast<::PROC *>(&ReadFile_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "GetVolumeInformationA",
+                reinterpret_cast<::PROC>(GetVolumeInformationA_hook),
+                reinterpret_cast<::PROC *>(&GetVolumeInformationA_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "QueryDosDeviceA",
+                reinterpret_cast<::PROC>(QueryDosDeviceA_hook),
+                reinterpret_cast<::PROC *>(&QueryDosDeviceA_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "QueryDosDeviceW",
+                reinterpret_cast<::PROC>(QueryDosDeviceW_hook),
+                reinterpret_cast<::PROC *>(&QueryDosDeviceW_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "GetLogicalDrives",
+                reinterpret_cast<::PROC>(GetLogicalDrives_hook),
+                reinterpret_cast<::PROC *>(&GetLogicalDrives_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "GetDiskFreeSpaceA",
+                reinterpret_cast<::PROC>(GetDiskFreeSpaceA_hook),
+                reinterpret_cast<::PROC *>(&GetDiskFreeSpaceA_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "GetDiskFreeSpaceW",
+                reinterpret_cast<::PROC>(GetDiskFreeSpaceW_hook),
+                reinterpret_cast<::PROC *>(&GetDiskFreeSpaceW_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "FindFirstVolumeA",
+                reinterpret_cast<::PROC>(FindFirstVolumeA_hook),
+                reinterpret_cast<::PROC *>(&FindFirstVolumeA_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "FindFirstVolumeW",
+                reinterpret_cast<::PROC>(FindFirstVolumeW_hook),
+                reinterpret_cast<::PROC *>(&FindFirstVolumeW_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "GetFileAttributesA",
+                reinterpret_cast<::PROC>(GetFileAttributesA_hook),
+                reinterpret_cast<::PROC *>(&GetFileAttributesA_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "GetFileAttributesW",
+                reinterpret_cast<::PROC>(GetFileAttributesW_hook),
+                reinterpret_cast<::PROC *>(&GetFileAttributesW_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "IsDebuggerPresent",
+                reinterpret_cast<::PROC>(IsDebuggerPresent_hook),
+                reinterpret_cast<::PROC *>(&IsDebuggerPresent_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "ReadProcessMemory",
+                reinterpret_cast<::PROC>(ReadProcessMemory_hook),
+                reinterpret_cast<::PROC *>(&ReadProcessMemory_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "ExitProcess",
+                reinterpret_cast<::PROC>(ExitProcess_hook),
+                reinterpret_cast<::PROC *>(&ExitProcess_orig));
+
+            hook_iat(
+                "kernel32.dll",
+                "TerminateProcess",
+                reinterpret_cast<::PROC>(TerminateProcess_hook),
+                reinterpret_cast<::PROC *>(&TerminateProcess_orig));
+
+            std::uint8_t nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+            auto old_protect = DWORD{};
+            auto res = BOOL{};
+
+            {
+                // auto bit_flip = 0xfe;
+                // auto *int1_addr = reinterpret_cast<void *>(0x00422166 + 6);
+                // auto res = ::VirtualProtect(int1_addr, sizeof(nops), PAGE_EXECUTE_READWRITE, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (int1_addr)");
+                // log("overwriting int1_addr with nops: {}", int1_addr);
+                // std::memcpy(int1_addr, &bit_flip, sizeof(bit_flip));
+                // res = ::VirtualProtect(int1_addr, sizeof(nops), old_protect, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (int1_addr second call)");
+
+                // auto write_mode = std::uint8_t{0x66};
+                // auto *write_mode_addr = reinterpret_cast<void *>(0x00040aa56);
+                // res = ::VirtualProtect(write_mode_addr, sizeof(write_mode), PAGE_EXECUTE_READWRITE, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (write_mode_addr)");
+                // log("overwriting write_mode_addr with: {}", write_mode_addr);
+                // std::memcpy(write_mode_addr, &write_mode, sizeof(write_mode));
+                // res = ::VirtualProtect(write_mode_addr, sizeof(write_mode), old_protect, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (write_mode_addr second call)");
+
+                //
+                // auto *mod_check_addr = reinterpret_cast<void *>(0x000040c1bc);
+                // res = ::VirtualProtect(mod_check_addr, sizeof(nops), PAGE_EXECUTE_READWRITE, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (mod_check_addr)");
+                // log("overwriting mod_check_addr with nops: {}", mod_check_addr);
+                // std::memcpy(mod_check_addr, nops, 2);
+                // res = ::VirtualProtect(mod_check_addr, sizeof(nops), old_protect, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (mod_check_addr second call)");
+
+                // auto *patch_detech_addr = reinterpret_cast<void *>(0x000041bc38);
+                // auto ret_isntr = std::uint8_t{0xc3};
+                // res = ::VirtualProtect(patch_detech_addr, sizeof(ret_isntr), PAGE_EXECUTE_READWRITE, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (patch_detech_addr)");
+                // log("overwriting patch_detech_addr with: {}", patch_detech_addr);
+                // std::memcpy(patch_detech_addr, &ret_isntr, sizeof(ret_isntr));
+                // res = ::VirtualProtect(patch_detech_addr, sizeof(ret_isntr), old_protect, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (patch_detech_addr second call)");
+
+                // std::uint32_t no_debugger_flags[] = {0x422a9d, 0x1, 0x19dba0};
+                // auto no_debugger_flag_addr = reinterpret_cast<void *>(0x00428a44);
+                // res = ::VirtualProtect(
+                //     no_debugger_flag_addr, sizeof(no_debugger_flags), PAGE_EXECUTE_READWRITE, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (no_debugger_flag)");
+                // log("overwriting no_debugger_flag");
+                //
+                // std::memcpy(no_debugger_flag_addr, &no_debugger_flags, sizeof(no_debugger_flags));
+                // res = ::VirtualProtect(no_debugger_flag_addr, sizeof(no_debugger_flags), old_protect, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (no_debugger_flag second call)");
+
+                // auto *exception_check_jmp_addr = reinterpret_cast<void *>(0x004221e9);
+                // std::uint8_t always_jmp[] = {0xe9, 0xa7, 0x01, 0x00, 0x00};
+                // res = ::VirtualProtect(
+                //     exception_check_jmp_addr, sizeof(always_jmp), PAGE_EXECUTE_READWRITE, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (exception_check_jmp_addr)");
+                // log("overwriting exception_check_jmp_addr with: {}", exception_check_jmp_addr);
+                // std::memcpy(exception_check_jmp_addr, always_jmp, sizeof(always_jmp));
+                // res = ::VirtualProtect(exception_check_jmp_addr, sizeof(always_jmp), old_protect, &old_protect);
+                // ensure(res != 0, "VirtualProtect failed (exception_check_jmp_addr second call)");
+            }
+
+            // {
+            //     auto peb_check_jmp_addr = reinterpret_cast<void *>(0x000042409a);
+            //     res = ::VirtualProtect(peb_check_jmp_addr, sizeof(nops), PAGE_EXECUTE_READWRITE, &old_protect);
+            //     ensure(res != 0, "VirtualProtect failed (peb_check_jmp_addr)");
+            //     log("overwriting peb_check_jmp_addr with nops: {}", peb_check_jmp_addr);
+            //     std::memcpy(peb_check_jmp_addr, nops, sizeof(nops));
+            //     res = ::VirtualProtect(peb_check_jmp_addr, sizeof(nops), old_protect, &old_protect);
+            //     ensure(res != 0, "VirtualProtect failed (peb_check_jmp_addr second call)");
+            // }
+            //
+            // {
+            //     auto peb_debugger_jmp_addr = reinterpret_cast<void *>(0x04212D5);
+            //     res = ::VirtualProtect(peb_debugger_jmp_addr, sizeof(nops), PAGE_EXECUTE_READWRITE, &old_protect);
+            //     ensure(res != 0, "VirtualProtect failed (peb_debugger_jmp_addr)");
+            //     log("overwriting peb_debugger_jmp_addr with nops: {}", peb_debugger_jmp_addr);
+            //     std::memcpy(peb_debugger_jmp_addr, nops, sizeof(nops));
+            //     res = ::VirtualProtect(peb_debugger_jmp_addr, sizeof(nops), old_protect, &old_protect);
+            //     ensure(res != 0, "VirtualProtect failed (peb_debugger_jmp_addr second call)");
+            // }
+            //
+            // {
+            //     auto cc_check_addr = reinterpret_cast<void *>(0x0042162f);
+            //     auto cc_check_jmp = std::uint8_t{0xeb};
+            //     res = ::VirtualProtect(cc_check_addr, sizeof(cc_check_jmp), PAGE_EXECUTE_READWRITE, &old_protect);
+            //     ensure(res != 0, "VirtualProtect failed (cc_check_addr)");
+            //     log("overwriting cc_check_addr with: {}", cc_check_jmp);
+            //     std::memcpy(cc_check_addr, &cc_check_jmp, sizeof(cc_check_jmp));
+            //     res = ::VirtualProtect(cc_check_addr, sizeof(cc_check_jmp), old_protect, &old_protect);
+            //     ensure(res != 0, "VirtualProtect failed (cc_check_addr second call)");
+            // }
+            //
+
+            ::Sleep(2000);
             break;
         }
         case DLL_PROCESS_DETACH: log("DLL_PROCESS_DETACH"); break;
